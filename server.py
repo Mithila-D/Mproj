@@ -28,7 +28,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import faiss
+from pinecone import Pinecone, ServerlessSpec
 from groq import Groq
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -47,13 +47,12 @@ GROQ_MODEL       = "llama-3.1-8b-instant"   # fast & free on Groq
 SEED_URLS = [
     "https://aiml.pccoepune.com/",
     "https://aiml.pccoepune.com/aiml-hod",
-    "https://aiml.pccoepune.com/faculty",
+    "https://aiml.pccoepune.com/faculty-profile",
     "https://aiml.pccoepune.com/about",
-    "https://aiml.pccoepune.com/activities",
-    "https://aiml.pccoepune.com/research",
-    "https://aiml.pccoepune.com/students",
-    "https://aiml.pccoepune.com/placements",
-    "https://aiml.pccoepune.com/contact",
+    "https://aiml.pccoepune.com/research-area-sigs",
+    "https://aiml.pccoepune.com/stud-activities",
+    "https://aiml.pccoepune.com/placement",
+    "https://aiml.pccoepune.com/contact"
 ]
 
 # Greeting map — edit freely. Keys are lowercase trigger phrases.
@@ -78,7 +77,7 @@ groq_client: Optional[Groq] = None
 face_encodings: list = []
 face_names: list = []
 rag_chunks: list[str] = []       # plain text chunks
-rag_index: Optional[faiss.IndexFlatL2] = None   # FAISS over chunk embeddings (TF-IDF-style via hashing)
+rag_index: Optional[object] = None   # Pinecone index object
 rag_vectors: Optional[np.ndarray] = None
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
@@ -219,30 +218,73 @@ def text_to_vector(text: str, dim: int = 128) -> np.ndarray:
         vec /= norm
     return vec
 
-def build_faiss_index(chunks: list[str]):
-    global rag_index, rag_vectors
+def build_vector_index(chunks: list[str]):
+    """Create / populate a Pinecone index from `chunks`.
+    Requires `PINECONE_API_KEY` in environment. Serverless region is set
+    via `ServerlessSpec` when creating the index.
+    """
+    global rag_index
     dim = 128
-    vecs = np.array([text_to_vector(c, dim) for c in chunks], dtype=np.float32)
-    index = faiss.IndexFlatL2(dim)
-    index.add(vecs)
-    rag_index   = index
-    rag_vectors = vecs
-    log.info(f"FAISS index built: {len(chunks)} chunks")
+    api_key = os.getenv("PINECONE_API_KEY", "")
+    index_name = os.getenv("PINECONE_INDEX_NAME", "aiml-rag")
+
+    if not api_key:
+        log.warning("PINECONE_API_KEY not set — vector DB disabled")
+        return
+
+    try:
+        pc = Pinecone(api_key=api_key)
+        existing = pc.list_indexes().names()
+        if index_name not in existing:
+            pc.create_index(
+                name=index_name,
+                dimension=dim,
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+            )
+        index = pc.Index(index_name)
+
+        # upsert in batches
+        to_upsert = []
+        for i, c in enumerate(chunks):
+            vec = text_to_vector(c, dim).astype(float).tolist()
+            meta = {"text": c}
+            to_upsert.append((f"chunk-{i}", vec, meta))
+
+        # Pinecone accepts batches; do in chunks of 100
+        batch_size = 100
+        for i in range(0, len(to_upsert), batch_size):
+            batch = to_upsert[i : i + batch_size]
+            index.upsert(vectors=batch)
+
+        rag_index = index
+        log.info(f"Pinecone index ready: {len(chunks)} chunks -> index '{index_name}'")
+    except Exception as e:
+        log.error(f"Failed to initialize Pinecone index: {e}")
 
 def retrieve_chunks(query: str, k: int = MAX_RAG_CHUNKS) -> str:
     if rag_index is None or not rag_chunks:
         return ""
-    qvec = text_to_vector(query).reshape(1, -1)
+    qvec = text_to_vector(query).astype(float).tolist()
     k    = min(k, len(rag_chunks))
-    _, idxs = rag_index.search(qvec, k)
-    results = [rag_chunks[i] for i in idxs[0] if i < len(rag_chunks)]
-    return "\n\n".join(results)
+    try:
+        resp = rag_index.query(vector=qvec, top_k=k, include_metadata=True)
+        matches = resp.get("matches", []) if isinstance(resp, dict) else resp.matches
+        texts = []
+        for m in matches:
+            meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
+            if meta and "text" in meta:
+                texts.append(meta["text"])
+        return "\n\n".join(texts)
+    except Exception as e:
+        log.error(f"Pinecone query failed: {e}")
+        return ""
 
 def load_rag_from_cache():
     global rag_chunks
     with open(WEBSITE_CACHE, "r", encoding="utf-8") as f:
         rag_chunks = json.load(f)
-    build_faiss_index(rag_chunks)
+    build_vector_index(rag_chunks)
     log.info(f"RAG loaded from cache: {len(rag_chunks)} chunks")
 
 def chunk_text(text: str, size: int = CHUNK_SIZE) -> list[str]:
@@ -329,5 +371,5 @@ async def crawl_and_index():
     with open(WEBSITE_CACHE, "w", encoding="utf-8") as f:
         json.dump(all_chunks, f, ensure_ascii=False)
 
-    build_faiss_index(rag_chunks)
+    build_vector_index(rag_chunks)
     log.info(f"Crawl complete: {len(visited)} pages, {len(rag_chunks)} chunks saved")
