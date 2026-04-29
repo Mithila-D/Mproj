@@ -1,0 +1,18 @@
+# render.yaml — Render deployment config
+# Place this in your GitHub repo root alongside server.py
+
+services:
+  - type: web
+    name: rpi-ai-server
+    runtime: python
+    buildCommand: pip install -r requirements_server.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false          # set manually in Render dashboard
+      - key: CRAWL_SECRET
+        sync: false          # set manually in Render dashboard
+    disk:
+      name: data
+      mountPath: /opt/render/project/src
+      sizeGB: 1              # free tier allows 1GB disk
