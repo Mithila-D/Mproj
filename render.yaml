@@ -5,7 +5,7 @@ services:
   - type: web
     name: rpi-ai-server
     runtime: python
-    buildCommand: pip install -r requirements_server.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: GROQ_API_KEY
