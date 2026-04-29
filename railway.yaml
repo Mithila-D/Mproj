@@ -1,4 +1,4 @@
-# render.yaml — Render deployment config
+# railway.yaml
 # Place this in your GitHub repo root alongside server.py
 
 services:
